@@ -68,7 +68,7 @@ class TransactionFetcher:
         existing_batch = self.session.query(FetchBatch).filter(
             FetchBatch.company_code == sub.code,
             FetchBatch.fetch_date == target_date,
-            FetchBatch.status == "success",
+            FetchBatch.status == "成功",
         ).first()
         if existing_batch:
             return sub.code, 0, f"该日期已成功导入{existing_batch.record_count}条, 跳过重复导入", 0.0

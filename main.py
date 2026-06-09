@@ -59,11 +59,13 @@ def cmd_fetch(args):
     target_date = date.fromisoformat(args.date) if args.date else date.today() - timedelta(days=1)
     fetcher = TransactionFetcher()
     results = fetcher.daily_fetch_all(target_date)
-    print(f"{'公司编码':<10} {'公司名称':<16} {'导入条数':>8} {'状态':<6} {'说明'}")
-    print("-" * 70)
+    print(f"{'公司编码':<10} {'公司名称':<16} {'导入条数':>8} {'状态':<8} {'耗时':>6} {'说明'}")
+    print("-" * 80)
     for code, info in results.items():
-        status_icon = "✓" if info["status"] == "成功" else "✗"
-        print(f"{code:<10} {info['company_name']:<16} {info['count']:>8} {status_icon} {info['status']:<4} {info['message']}")
+        status = info["status"]
+        icon = {"成功": "✓", "跳过": "→", "空数据": "○", "失败": "✗"}.get(status, "?")
+        elapsed = f"{info.get('elapsed', 0):.1f}s"
+        print(f"{code:<10} {info['company_name']:<16} {info['count']:>8} {icon} {status:<6} {elapsed:>6} {info['message']}")
 
 
 def cmd_match(args):
@@ -154,14 +156,32 @@ def cmd_report(args):
     setup_logging()
     gen = ReportGenerator()
     fmt = args.format if args.format else "all"
+    is_draft = getattr(args, "draft", False)
+
+    risks = gen.check_report_risks(args.period)
+    if risks:
+        print(f"⚠ 报表生成前检查 - 发现 {len(risks)} 个风险项:")
+        for r in risks:
+            level_icon = "🔴" if r["level"] == "high" else "🟡"
+            print(f"  {level_icon} [{r['type']}] {r['description']}")
+        print()
+
+        high_risks = [r for r in risks if r["level"] == "high"]
+        if high_risks and not is_draft:
+            print("存在高风险项, 无法生成正式版报表。请先处理上述风险, 或使用 --draft 生成草稿版。")
+            return
+        if is_draft:
+            print("草稿模式: 忽略风险项, 生成草稿版报表(仅供内部参考)\n")
 
     if fmt in ("excel", "all"):
-        path = gen.export_to_excel(args.period, "all")
-        print(f"Excel导出: {path}")
+        path = gen.export_to_excel(args.period, "all", is_draft=is_draft)
+        tag = " (草稿)" if is_draft else ""
+        print(f"Excel导出{tag}: {path}")
 
     if fmt in ("pdf", "all"):
-        path = gen.export_to_pdf(args.period, "all")
-        print(f"PDF导出: {path}")
+        path = gen.export_to_pdf(args.period, "all", is_draft=is_draft)
+        tag = " (草稿)" if is_draft else ""
+        print(f"PDF导出{tag}: {path}")
 
 
 def cmd_quarterly(args):
@@ -387,12 +407,125 @@ def cmd_list_workorders(args):
     if not orders:
         print("暂无工单数据")
         return
-    print(f"{'ID(前8位)':<10} {'差异类型':<20} {'责任公司':<10} {'差异金额':>15} {'状态':<12} {'分配给':<8}")
-    print("-" * 80)
+    print(f"{'ID(前8位)':<10} {'差异类型':<22} {'责任公司':<10} {'差异金额':>15} {'状态':<12} {'分类':<10} {'分配给':<8}")
+    print("-" * 95)
     for wo in orders:
-        print(f"{wo.id[:8]:<10} {wo.discrepancy_type:<20} {wo.responsible_company_code:<10} "
+        print(f"{wo.id[:8]:<10} {wo.discrepancy_type:<22} {wo.responsible_company_code:<10} "
               f"{float(wo.discrepancy_amount or 0):>15,.2f} {wo.status.value:<12} "
-              f"{wo.assigned_to or '-':<8}")
+              f"{wo.category or '-':<10} {wo.assigned_to or '-':<8}")
+
+
+def cmd_show_workorder(args):
+    from work_order import WorkOrderManager
+    from notification import setup_logging
+    setup_logging()
+    mgr = WorkOrderManager()
+    detail = mgr.get_work_order_detail_dict(args.id)
+    if not detail:
+        print(f"工单 {args.id} 不存在")
+        return
+    print(f"=== 工单详情 ===")
+    print(f"  ID: {detail['id']}")
+    print(f"  差异类型: {detail['discrepancy_type']}")
+    print(f"  差异金额: {detail['discrepancy_amount']:,.2f}")
+    print(f"  责任公司: {detail['responsible_company_code']}")
+    print(f"  分配给: {detail['assigned_to'] or '-'}")
+    print(f"  状态: {detail['status']}")
+    print(f"  分类: {detail['category'] or '(未分类)'}")
+    print(f"  说明: {detail['discrepancy_description']}")
+    if detail.get("resolution_note"):
+        print(f"  解决说明: {detail['resolution_note']}")
+    if detail.get("processing_notes"):
+        print(f"  处理记录:")
+        for line in detail["processing_notes"].split("\n"):
+            print(f"    {line}")
+    print(f"  创建时间: {detail['created_at']}")
+    if detail.get("resolved_at"):
+        print(f"  解决时间: {detail['resolved_at']}")
+    if detail.get("related_transactions"):
+        print(f"  关联交易:")
+        for tx in detail["related_transactions"]:
+            print(f"    {tx['direction']} | {tx['company_code']}→{tx['counterparty_code']} "
+                  f"| {tx['product_code']} | {tx['amount']:,.2f} | 状态: {tx['match_status']}")
+
+
+def cmd_update_workorder(args):
+    from work_order import WorkOrderManager
+    from notification import setup_logging
+    setup_logging()
+    mgr = WorkOrderManager()
+    has_update = any([args.status, args.note, args.category, args.assign])
+    if not has_update:
+        print("请至少指定一项更新: --status, --note, --category, --assign")
+        return
+    wo = mgr.update_work_order(
+        work_order_id=args.id,
+        status=args.status,
+        note=args.note,
+        category=args.category,
+        assigned_to=args.assign,
+    )
+    if not wo:
+        print(f"工单 {args.id} 不存在或状态无效")
+        return
+    print(f"✓ 工单已更新: ID={wo.id[:8]}")
+    print(f"  当前状态: {wo.status.value}")
+    if wo.category:
+        print(f"  分类: {wo.category}")
+    if wo.assigned_to:
+        print(f"  分配给: {wo.assigned_to}")
+
+
+def cmd_list_fetch_batches(args):
+    from models import FetchBatch, SessionLocal
+    from notification import setup_logging
+    setup_logging()
+    session = SessionLocal()
+    query = session.query(FetchBatch)
+    if args.company:
+        query = query.filter(FetchBatch.company_code == args.company)
+    if args.date:
+        fetch_date = date.fromisoformat(args.date)
+        query = query.filter(FetchBatch.fetch_date == fetch_date)
+    batches = query.order_by(FetchBatch.created_at.desc()).limit(20).all()
+    if not batches:
+        print("暂无抓取批次记录")
+        return
+    print(f"{'批次ID(前8位)':<12} {'公司':<10} {'日期':<12} {'状态':<8} {'条数':>6} {'耗时':>6} {'错误信息'}")
+    print("-" * 90)
+    for b in batches:
+        err = (b.error_message or "")[:35]
+        print(f"{b.id[:8]:<12} {b.company_code:<10} {str(b.fetch_date):<12} "
+              f"{b.status:<8} {b.record_count:>6} {b.duration_seconds:>5.1f}s {err}")
+
+
+def cmd_list_reports(args):
+    from models import ConsolidatedReport, SessionLocal
+    from notification import setup_logging
+    setup_logging()
+    session = SessionLocal()
+    query = session.query(ConsolidatedReport)
+    if args.period:
+        query = query.filter_by(period=args.period)
+    reports = query.order_by(ConsolidatedReport.generated_at.desc()).limit(20).all()
+    if not reports:
+        print("暂无报表记录")
+        return
+    print(f"{'ID(前8位)':<10} {'期间':<10} {'类型':<8} {'草稿':<4} {'PDF':<6} {'Excel':<6} {'风险项':>6} {'生成时间'}")
+    print("-" * 80)
+    for r in reports:
+        has_pdf = "✓" if r.file_path_pdf else "✗"
+        has_excel = "✓" if r.file_path_excel else "✗"
+        is_draft = "是" if r.is_draft else "否"
+        risk_count = 0
+        if r.risk_items:
+            try:
+                risk_count = len(json.loads(r.risk_items))
+            except Exception:
+                pass
+        gen_time = r.generated_at.strftime("%Y-%m-%d %H:%M") if r.generated_at else "-"
+        print(f"{r.id[:8]:<10} {r.period:<10} {r.report_type:<8} {is_draft:<4} "
+              f"{has_pdf:<6} {has_excel:<6} {risk_count:>6} {gen_time}")
 
 
 def cmd_demo(args):
@@ -568,6 +701,7 @@ def main():
     p_report = subparsers.add_parser("report", help="生成合并报表")
     p_report.add_argument("--period", required=True, help="期间 YYYY-MM")
     p_report.add_argument("--format", choices=["excel", "pdf", "all"], default="all")
+    p_report.add_argument("--draft", action="store_true", help="生成草稿版(忽略风险项)")
 
     p_quarterly = subparsers.add_parser("quarterly", help="生成季度报告")
     p_quarterly.add_argument("--year", type=int, required=True)
@@ -624,6 +758,26 @@ def main():
 
     subparsers.add_parser("demo", help="生成演示数据(含差异场景和数据源CSV)")
 
+    p_show_wo = subparsers.add_parser("show-workorder", help="查看工单详情")
+    p_show_wo.add_argument("--id", required=True, help="工单ID")
+
+    p_update_wo = subparsers.add_parser("update-workorder", help="更新工单状态/分类/备注")
+    p_update_wo.add_argument("--id", required=True, help="工单ID")
+    p_update_wo.add_argument("--status", choices=["open", "in_progress", "resolved", "escalated", "closed"],
+                              help="新状态")
+    p_update_wo.add_argument("--note", help="处理备注")
+    p_update_wo.add_argument("--category",
+                              choices=["数据录入错误", "系统延迟", "价格调整", "退货", "其他"],
+                              help="原因分类")
+    p_update_wo.add_argument("--assign", help="分配给(人员姓名)")
+
+    p_fb = subparsers.add_parser("list-fetch-batches", help="查询抓取批次记录")
+    p_fb.add_argument("--company", help="按公司编码筛选")
+    p_fb.add_argument("--date", help="按日期筛选 YYYY-MM-DD")
+
+    p_lr = subparsers.add_parser("list-reports", help="查询历史报表")
+    p_lr.add_argument("--period", help="按期间筛选 YYYY-MM")
+
     args = parser.parse_args()
 
     commands = {
@@ -648,6 +802,10 @@ def main():
         "update-subsidiary-source": cmd_update_subsidiary_source,
         "list-subsidiaries": cmd_list_subsidiaries,
         "list-workorders": cmd_list_workorders,
+        "show-workorder": cmd_show_workorder,
+        "update-workorder": cmd_update_workorder,
+        "list-fetch-batches": cmd_list_fetch_batches,
+        "list-reports": cmd_list_reports,
         "demo": cmd_demo,
     }
 

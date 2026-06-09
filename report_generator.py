@@ -1,4 +1,5 @@
 import uuid
+import json
 import logging
 import os
 from datetime import datetime
@@ -761,13 +762,30 @@ class ReportGenerator:
         ws.column_dimensions["C"].width = 20
 
     def _save_report_record(self, period: str, report_type: str,
-                            pdf_path: str = None, excel_path: str = None):
+                            pdf_path: str = None, excel_path: str = None,
+                            is_draft: bool = False, risk_items: List = None):
+        existing = self.session.query(ConsolidatedReport).filter_by(
+            period=period, report_type=report_type
+        ).first()
+        if existing:
+            if pdf_path:
+                existing.file_path_pdf = pdf_path
+            if excel_path:
+                existing.file_path_excel = excel_path
+            existing.is_draft = is_draft
+            existing.risk_items = json.dumps(risk_items or [], ensure_ascii=False)
+            existing.generated_at = datetime.utcnow()
+            self.session.commit()
+            return
+
         record = ConsolidatedReport(
             id=str(uuid.uuid4()),
             period=period,
             report_type=report_type,
             file_path_pdf=pdf_path,
             file_path_excel=excel_path,
+            is_draft=is_draft,
+            risk_items=json.dumps(risk_items or [], ensure_ascii=False),
             generated_by="system",
         )
         self.session.add(record)
