@@ -185,11 +185,16 @@ class TransactionFetcher:
             code, count, message, elapsed = self._fetch_for_subsidiary(sub, target_date)
             is_success = count > 0
             is_skip = "跳过重复导入" in message
-            is_empty = "0条记录" in message or "0条" in message or "未配置" in message
+            is_no_config = "未配置数据源" in message or "不支持的数据源类型" in message
+            is_empty = ("0条记录" in message or "0条" in message) and not is_no_config
+            is_file_missing = "文件不存在" in message
+            is_fail = "失败" in message
             if is_success:
                 status = "成功"
             elif is_skip:
                 status = "跳过"
+            elif is_no_config or is_file_missing or is_fail:
+                status = "失败"
             elif is_empty:
                 status = "空数据"
             else:

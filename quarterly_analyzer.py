@@ -79,6 +79,7 @@ class QuarterlyAnalyzer:
             "reconciliation_completion_rate": round(completion_rate, 2),
             "discrepancy_rate": round(discrepancy_rate, 2),
             "avg_processing_hours": round(avg_hours, 2),
+            "category_breakdown": self._category_breakdown(year, start_month, end_month),
             "previous_quarter": {
                 "year": prev_y,
                 "quarter": prev_q,
@@ -143,6 +144,34 @@ class QuarterlyAnalyzer:
         if quarter == 1:
             return 4, year - 1
         return quarter - 1, year
+
+    def _category_breakdown(self, year: int, start_month: int, end_month: int) -> List[Dict]:
+        from sqlalchemy import case
+        all_orders = self.session.query(DiscrepancyWorkOrder).filter(
+            extract("year", DiscrepancyWorkOrder.created_at) == year,
+            extract("month", DiscrepancyWorkOrder.created_at).between(start_month, end_month),
+        ).all()
+
+        cat_data = {}
+        for wo in all_orders:
+            cat = wo.category or "(未分类)"
+            cat_data.setdefault(cat, {"count": 0, "total_amount": Decimal("0"), "hours": []})
+            cat_data[cat]["count"] += 1
+            cat_data[cat]["total_amount"] += wo.discrepancy_amount or Decimal("0")
+            if wo.resolved_at and wo.created_at and wo.status == WorkOrderStatus.RESOLVED:
+                hours = (wo.resolved_at - wo.created_at).total_seconds() / 3600
+                cat_data[cat]["hours"].append(hours)
+
+        result = []
+        for cat, data in sorted(cat_data.items()):
+            avg_h = sum(data["hours"]) / len(data["hours"]) if data["hours"] else 0
+            result.append({
+                "category": cat,
+                "count": data["count"],
+                "total_amount": float(data["total_amount"]),
+                "avg_processing_hours": round(avg_h, 2),
+            })
+        return result
 
     def generate_trend_chart(self, year: int, quarter: int) -> str:
         """生成季度趋势对比图"""

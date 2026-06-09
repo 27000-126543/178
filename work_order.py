@@ -224,6 +224,9 @@ class WorkOrderManager:
                 wo.status = new_status
                 if new_status == WorkOrderStatus.IN_PROGRESS and not wo.assigned_to and assigned_to:
                     wo.assigned_to = assigned_to
+                if new_status == WorkOrderStatus.RESOLVED:
+                    wo.resolved_at = datetime.utcnow()
+                    self._update_related_transactions(wo)
             except ValueError:
                 logger.error(f"无效工单状态: {status}")
                 return None
@@ -235,16 +238,14 @@ class WorkOrderManager:
             existing_notes = wo.processing_notes or ""
             timestamp = datetime.utcnow().strftime("%Y-%m-%d %H:%M")
             wo.processing_notes = f"{existing_notes}\n[{timestamp}] {note}" if existing_notes else f"[{timestamp}] {note}"
+            if status and WorkOrderStatus(status) == WorkOrderStatus.RESOLVED:
+                wo.resolution_note = note
 
         if assigned_to:
             wo.assigned_to = assigned_to
 
         wo.updated_at = datetime.utcnow()
         self.session.commit()
-
-        if status == WorkOrderStatus.RESOLVED.value:
-            self._update_related_transactions(wo)
-            self.session.commit()
 
         self._log_operation("update_work_order", work_order_id,
                             f"状态={status or '不变'}, 分类={category or '不变'}")

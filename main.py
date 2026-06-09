@@ -166,12 +166,10 @@ def cmd_report(args):
             print(f"  {level_icon} [{r['type']}] {r['description']}")
         print()
 
-        high_risks = [r for r in risks if r["level"] == "high"]
-        if high_risks and not is_draft:
-            print("存在高风险项, 无法生成正式版报表。请先处理上述风险, 或使用 --draft 生成草稿版。")
+        if not is_draft:
+            print("存在风险项, 无法生成正式版报表。请先处理上述风险, 或使用 --draft 生成草稿版。")
             return
-        if is_draft:
-            print("草稿模式: 忽略风险项, 生成草稿版报表(仅供内部参考)\n")
+        print("草稿模式: 忽略风险项, 生成草稿版报表(仅供内部参考)\n")
 
     if fmt in ("excel", "all"):
         path = gen.export_to_excel(args.period, "all", is_draft=is_draft)
@@ -197,6 +195,13 @@ def cmd_quarterly(args):
     print(f"  对账完成率: {result['reconciliation_completion_rate']}%")
     print(f"  差异率: {result['discrepancy_rate']}%")
     print(f"  平均处理时长: {result['avg_processing_hours']}小时")
+
+    cat_breakdown = result.get("category_breakdown", [])
+    if cat_breakdown:
+        print(f"  差异原因分类统计:")
+        print(f"    {'分类':<14} {'工单数':>6} {'金额合计':>16} {'平均处理时长(h)':>14}")
+        for c in cat_breakdown:
+            print(f"    {c['category']:<14} {c['count']:>6} {c['total_amount']:>16,.2f} {c['avg_processing_hours']:>14.2f}")
 
     trend = result.get("trend", {})
     if trend.get("description"):

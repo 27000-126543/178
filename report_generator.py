@@ -298,14 +298,17 @@ class ReportGenerator:
             })
 
         major_open_orders = self.session.query(DiscrepancyWorkOrder).filter(
-            DiscrepancyWorkOrder.status.in_([WorkOrderStatus.OPEN, WorkOrderStatus.IN_PROGRESS]),
+            DiscrepancyWorkOrder.status.in_([
+                WorkOrderStatus.OPEN, WorkOrderStatus.IN_PROGRESS, WorkOrderStatus.ESCALATED
+            ]),
             DiscrepancyWorkOrder.discrepancy_amount >= 100000,
         ).all()
         for wo in major_open_orders:
+            status_label = "升级中" if wo.status == WorkOrderStatus.ESCALATED else "未解决"
             risks.append({
                 "level": "high",
                 "type": "unresolved_discrepancy",
-                "description": f"未解决差异工单(ID={wo.id[:8]})差异金额{float(wo.discrepancy_amount or 0):,.2f}元, 类型={wo.discrepancy_type}",
+                "description": f"{status_label}差异工单(ID={wo.id[:8]})差异金额{float(wo.discrepancy_amount or 0):,.2f}元, 类型={wo.discrepancy_type}",
                 "amount": float(wo.discrepancy_amount or 0),
                 "id": wo.id,
             })
@@ -318,7 +321,7 @@ class ReportGenerator:
             ).count()
             if tb_count == 0:
                 risks.append({
-                    "level": "medium",
+                    "level": "high",
                     "type": "missing_trial_balance",
                     "description": f"子公司{sub.name}({sub.code})未提交{period}期间试算平衡表",
                     "amount": 0,
@@ -757,6 +760,13 @@ class ReportGenerator:
             c.font = data_font
             c.number_format = num_format
             row += 1
+        row += 1
+        ws.cell(row=row, column=1, value="四、会计政策").font = sub_header_font
+        row += 1
+        policy = data.get("accounting_policies", "")
+        if policy:
+            ws.cell(row=row, column=1, value=policy).font = data_font
+            row += 1
         ws.column_dimensions["A"].width = 25
         ws.column_dimensions["B"].width = 40
         ws.column_dimensions["C"].width = 20
@@ -764,20 +774,7 @@ class ReportGenerator:
     def _save_report_record(self, period: str, report_type: str,
                             pdf_path: str = None, excel_path: str = None,
                             is_draft: bool = False, risk_items: List = None):
-        existing = self.session.query(ConsolidatedReport).filter_by(
-            period=period, report_type=report_type
-        ).first()
-        if existing:
-            if pdf_path:
-                existing.file_path_pdf = pdf_path
-            if excel_path:
-                existing.file_path_excel = excel_path
-            existing.is_draft = is_draft
-            existing.risk_items = json.dumps(risk_items or [], ensure_ascii=False)
-            existing.generated_at = datetime.utcnow()
-            self.session.commit()
-            return
-
+        report_status = "draft" if is_draft else "published"
         record = ConsolidatedReport(
             id=str(uuid.uuid4()),
             period=period,
@@ -787,6 +784,74 @@ class ReportGenerator:
             is_draft=is_draft,
             risk_items=json.dumps(risk_items or [], ensure_ascii=False),
             generated_by="system",
+            report_status=report_status,
         )
         self.session.add(record)
         self.session.commit()
+        return record
+
+    def publish_report(self, report_id: str, published_by: str) -> Optional[ConsolidatedReport]:
+        draft = self.session.query(ConsolidatedReport).filter_by(id=report_id).first()
+        if not draft:
+            return None
+        if draft.report_status != "draft":
+            return None
+
+        risks = self.check_report_risks(draft.period)
+        if risks:
+            return None
+
+        published = ConsolidatedReport(
+            id=str(uuid.uuid4()),
+            period=draft.period,
+            report_type=draft.report_type,
+            file_path_pdf=draft.file_path_pdf,
+            file_path_excel=draft.file_path_excel,
+            is_draft=False,
+            risk_items=draft.risk_items,
+            generated_at=draft.generated_at,
+            generated_by=draft.generated_by,
+            report_status="published",
+            published_by=published_by,
+            published_at=datetime.utcnow(),
+            draft_source_id=draft.id,
+        )
+        self.session.add(published)
+        self.session.commit()
+
+        log = OperationLog(
+            id=str(uuid.uuid4()),
+            operation_type="publish_report",
+            operator=published_by,
+            target_type="consolidated_report",
+            target_id=published.id,
+            detail=f"发布正式版报表, 期间={draft.period}, 草稿ID={draft.id[:8]}",
+        )
+        self.session.add(log)
+        self.session.commit()
+        return published
+
+    def revoke_report(self, report_id: str, revoked_by: str, reason: str) -> Optional[ConsolidatedReport]:
+        report = self.session.query(ConsolidatedReport).filter_by(id=report_id).first()
+        if not report:
+            return None
+        if report.report_status != "published":
+            return None
+
+        report.report_status = "revoked"
+        report.revoked_by = revoked_by
+        report.revoked_at = datetime.utcnow()
+        report.revoke_reason = reason
+        self.session.commit()
+
+        log = OperationLog(
+            id=str(uuid.uuid4()),
+            operation_type="revoke_report",
+            operator=revoked_by,
+            target_type="consolidated_report",
+            target_id=report.id,
+            detail=f"撤回正式版报表, 期间={report.period}, 原因={reason}",
+        )
+        self.session.add(log)
+        self.session.commit()
+        return report

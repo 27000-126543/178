@@ -239,6 +239,13 @@ class ConsolidatedReport(Base):
     risk_items = Column(Text)
     generated_at = Column(DateTime, default=datetime.utcnow)
     generated_by = Column(String(100))
+    report_status = Column(String(20), default="draft")
+    published_by = Column(String(100))
+    published_at = Column(DateTime)
+    revoked_by = Column(String(100))
+    revoked_at = Column(DateTime)
+    revoke_reason = Column(Text)
+    draft_source_id = Column(String(36))
 
 
 class OperationLog(Base):
