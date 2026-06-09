@@ -62,6 +62,8 @@ class Subsidiary(Base):
     cfo_name = Column(String(100))
     cfo_contact = Column(String(200))
     finance_staff = Column(Text)
+    data_source_type = Column(String(20), default="csv")
+    data_source_url = Column(String(500), default="")
     is_active = Column(Boolean, default=True)
     created_at = Column(DateTime, default=datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
@@ -116,6 +118,8 @@ class DiscrepancyWorkOrder(Base):
     escalated_at = Column(DateTime)
     resolved_at = Column(DateTime)
     resolution_note = Column(Text)
+    category = Column(String(50))
+    processing_notes = Column(Text)
     created_at = Column(DateTime, default=datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
     approval_records = relationship("ApprovalRecord", back_populates="work_order")
@@ -231,6 +235,8 @@ class ConsolidatedReport(Base):
     report_type = Column(String(50), nullable=False)
     file_path_pdf = Column(String(500))
     file_path_excel = Column(String(500))
+    is_draft = Column(Boolean, default=False)
+    risk_items = Column(Text)
     generated_at = Column(DateTime, default=datetime.utcnow)
     generated_by = Column(String(100))
 
@@ -265,6 +271,22 @@ class QuarterlyReport(Base):
     file_path_pdf = Column(String(500))
     file_path_excel = Column(String(500))
     generated_at = Column(DateTime, default=datetime.utcnow)
+
+
+class FetchBatch(Base):
+    __tablename__ = "fetch_batches"
+    __table_args__ = (
+        Index("ix_fb_company_date", "company_code", "fetch_date"),
+    )
+    id = Column(String(36), primary_key=True)
+    company_code = Column(String(50), nullable=False)
+    company_name = Column(String(200), nullable=False)
+    fetch_date = Column(Date, nullable=False)
+    status = Column(String(20), nullable=False)
+    record_count = Column(Integer, default=0)
+    error_message = Column(Text)
+    duration_seconds = Column(Float, default=0)
+    created_at = Column(DateTime, default=datetime.utcnow)
 
 
 def init_db():

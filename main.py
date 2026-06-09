@@ -5,29 +5,34 @@
 用法:
   python main.py init                          # 初始化数据库
   python main.py scheduler                     # 启动定时调度器
-  python main.py fetch --date 2025-06-01       # 手动触发交易抓取
-  python main.py match --date 2025-06-01       # 手动触发交易匹配
-  python main.py match-concurrent --date 2025-06-01  # 并发匹配
-  python main.py import-tb --file data.csv --company SUB01 --period 2025-06  # 导入试算平衡表
-  python main.py validate --period 2025-06     # 校验试算平衡
-  python main.py consolidate --period 2025-06  # 生成合并工作底稿和抵消分录
-  python main.py report --period 2025-06 --format excel  # 生成合并报表
-  python main.py report --period 2025-06 --format pdf
-  python main.py quarterly --year 2025 --quarter 2       # 生成季度报告
-  python main.py check-timeouts                # 检查超时工单
-  python main.py check-late --period 2025-06   # 检查延迟提交
-  python main.py check-anomalies               # 检查异常
-  python main.py add-elimination --period 2025-06 --amount 6000000  # 手工抵消分录
-  python main.py add-subsidiary --code SUB01 --name "子公司A" --ratio 0.8  # 添加子公司
-  python main.py list-subsidiaries             # 列出子公司
-  python main.py list-workorders [--status open]  # 查询工单
-  python main.py demo                          # 生成演示数据
+  python main.py fetch --date 2026-06-08       # 手动触发交易抓取
+  python main.py match --date 2026-06-08       # 手动触发交易匹配
+  python main.py match-concurrent --date 2026-06-08  # 并发匹配
+  python main.py import-tb --file data.csv --company SUB01 --period 2026-06
+  python main.py validate --period 2026-06     # 校验试算平衡
+  python main.py consolidate --period 2026-06  # 生成合并工作底稿和抵消分录
+  python main.py report --period 2026-06 --format excel
+  python main.py report --period 2026-06 --format pdf
+  python main.py quarterly --year 2026 --quarter 2
+  python main.py check-timeouts
+  python main.py check-late --period 2026-06
+  python main.py check-anomalies
+  python main.py add-elimination --period 2026-06 --amount 6000000  # 手工抵消分录
+  python main.py list-pending-approvals [--period 2026-06]  # 列出待审批抵消分录
+  python main.py approve-elimination --entry-id ID --role 子公司CFO --name 张三 [--comment 同意]
+  python main.py reject-elimination --entry-id ID --role 子公司CFO --name 张三 --comment 金额有误
+  python main.py add-subsidiary --code SUB01 --name "子公司A" --ratio 0.8
+  python main.py update-subsidiary-source --code SUB01 --source-type csv --source-url /path/to/data.csv
+  python main.py list-subsidiaries
+  python main.py list-workorders [--status open]
+  python main.py demo                          # 生成演示数据(含差异场景)
 """
 
 import argparse
 import sys
 import os
 import json
+import csv
 from datetime import date, datetime, timedelta
 from decimal import Decimal
 
@@ -54,7 +59,11 @@ def cmd_fetch(args):
     target_date = date.fromisoformat(args.date) if args.date else date.today() - timedelta(days=1)
     fetcher = TransactionFetcher()
     results = fetcher.daily_fetch_all(target_date)
-    print(f"抓取结果: {json.dumps(results, ensure_ascii=False, indent=2)}")
+    print(f"{'公司编码':<10} {'公司名称':<16} {'导入条数':>8} {'状态':<6} {'说明'}")
+    print("-" * 70)
+    for code, info in results.items():
+        status_icon = "✓" if info["status"] == "成功" else "✗"
+        print(f"{code:<10} {info['company_name']:<16} {info['count']:>8} {status_icon} {info['status']:<4} {info['message']}")
 
 
 def cmd_match(args):
@@ -64,7 +73,12 @@ def cmd_match(args):
     target_date = date.fromisoformat(args.date) if args.date else date.today() - timedelta(days=1)
     matcher = TransactionMatcher()
     result = matcher.match_batch(transaction_date=target_date)
-    print(f"匹配结果: {json.dumps(result, ensure_ascii=False, indent=2)}")
+    print(f"匹配结果:")
+    print(f"  待匹配: {result['total_unmatched']} 笔")
+    print(f"  完全匹配: {result['matched']} 笔")
+    print(f"  部分匹配: {result['partial']} 笔")
+    print(f"  单边流水: {result['single_sided']} 笔")
+    print(f"  生成差异工单: {result['discrepancy_created']} 张")
 
 
 def cmd_match_concurrent(args):
@@ -74,7 +88,12 @@ def cmd_match_concurrent(args):
     target_date = date.fromisoformat(args.date) if args.date else date.today() - timedelta(days=1)
     matcher = TransactionMatcher()
     result = matcher.match_concurrent(transaction_date=target_date)
-    print(f"并发匹配结果: {json.dumps(result, ensure_ascii=False, indent=2)}")
+    print(f"并发匹配结果:")
+    print(f"  待匹配: {result['total_unmatched']} 笔")
+    print(f"  完全匹配: {result['matched']} 笔")
+    print(f"  部分匹配: {result['partial']} 笔")
+    print(f"  单边流水: {result['single_sided']} 笔")
+    print(f"  生成差异工单: {result['discrepancy_created']} 张")
 
 
 def cmd_import_tb(args):
@@ -222,7 +241,76 @@ def cmd_add_elimination(args):
     entry = engine.add_manual_elimination_entry(args.period, entry_data, args.created_by or "admin")
     print(f"手工抵消分录已创建: ID={entry.id}, 金额={entry.amount}")
     if entry.requires_approval:
-        print(f"  ⚠ 金额超500万元, 触发三级审批")
+        print(f"  ⚠ 金额超500万元, 触发三级审批(子公司CFO → 集团财务总监 → CEO)")
+        print(f"  当前待审批: 子公司CFO")
+        print(f"  审批命令: python main.py approve-elimination --entry-id {entry.id} --role 子公司CFO --name 审批人姓名")
+
+
+def cmd_list_pending_approvals(args):
+    from consolidation import ConsolidationEngine
+    from notification import setup_logging
+    setup_logging()
+    engine = ConsolidationEngine()
+    results = engine.list_pending_approvals(period=args.period)
+    if not results:
+        print("无待审批的手工抵消分录")
+        return
+    print(f"{'分录ID(前8位)':<12} {'期间':<10} {'金额':>15} {'当前步骤':<14} {'创建人':<8} {'说明'}")
+    print("-" * 85)
+    for r in results:
+        print(f"{r['entry_id'][:8]:<12} {r['period']:<10} {r['amount']:>15,.2f} "
+              f"{r['current_step']:<14} {r.get('created_by', ''):<8} {(r.get('description') or '')[:30]}")
+        for a in r["approval_detail"]:
+            icon = {"approved": "✓", "pending": "○", "rejected": "✗", "cancelled": "-"}.get(a["status"], "?")
+            print(f"  {icon} {a['role']}: {a['status']}", end="")
+            if a["approver"]:
+                print(f" ({a['approver']})", end="")
+            if a["comment"]:
+                print(f" - {a['comment']}", end="")
+            print()
+
+
+def cmd_approve_elimination(args):
+    from consolidation import ConsolidationEngine
+    from notification import setup_logging
+    setup_logging()
+    engine = ConsolidationEngine()
+    success, message = engine.approve_elimination_entry(
+        entry_id=args.entry_id,
+        approver_role=args.role,
+        approver_name=args.name,
+        approved=True,
+        comment=args.comment or "",
+    )
+    if success:
+        print(f"✓ 审批通过: {message}")
+        results = engine.list_pending_approvals()
+        for r in results:
+            if r["entry_id"] == args.entry_id:
+                print(f"  下一步: {r['current_step']}")
+                break
+        else:
+            print(f"  全部审批完成, 该分录将计入合并报表")
+    else:
+        print(f"✗ 审批失败: {message}")
+
+
+def cmd_reject_elimination(args):
+    from consolidation import ConsolidationEngine
+    from notification import setup_logging
+    setup_logging()
+    engine = ConsolidationEngine()
+    success, message = engine.approve_elimination_entry(
+        entry_id=args.entry_id,
+        approver_role=args.role,
+        approver_name=args.name,
+        approved=False,
+        comment=args.comment or "",
+    )
+    if success:
+        print(f"✗ 已驳回: {message}")
+    else:
+        print(f"操作失败: {message}")
 
 
 def cmd_add_subsidiary(args):
@@ -237,11 +325,32 @@ def cmd_add_subsidiary(args):
         ownership_ratio=Decimal(str(args.ratio)),
         cfo_name=args.cfo or "",
         finance_staff=args.staff or "",
+        data_source_type=args.source_type or "csv",
+        data_source_url=args.source_url or "",
         is_active=True,
     )
     session.add(sub)
     session.commit()
     print(f"子公司已添加: {sub.name}({sub.code}), 持股比例 {sub.ownership_ratio}")
+    if sub.data_source_url:
+        print(f"  数据源: {sub.data_source_type} - {sub.data_source_url}")
+    else:
+        print(f"  数据源: 未配置, 请用 update-subsidiary-source 命令配置")
+
+
+def cmd_update_subsidiary_source(args):
+    from models import Subsidiary, SessionLocal
+    from notification import setup_logging
+    setup_logging()
+    session = SessionLocal()
+    sub = session.query(Subsidiary).filter_by(code=args.code).first()
+    if not sub:
+        print(f"子公司 {args.code} 不存在")
+        return
+    sub.data_source_type = args.source_type
+    sub.data_source_url = args.source_url
+    session.commit()
+    print(f"子公司 {sub.name}({sub.code}) 数据源已更新: {args.source_type} - {args.source_url}")
 
 
 def cmd_list_subsidiaries(args):
@@ -253,10 +362,12 @@ def cmd_list_subsidiaries(args):
     if not subs:
         print("暂无子公司数据")
         return
-    print(f"{'编码':<10} {'名称':<20} {'持股比例':<10} {'CFO':<10}")
-    print("-" * 55)
+    print(f"{'编码':<8} {'名称':<14} {'持股比例':<8} {'CFO':<6} {'数据源类型':<8} {'数据源URL'}")
+    print("-" * 80)
     for sub in subs:
-        print(f"{sub.code:<10} {sub.name:<20} {float(sub.ownership_ratio):<10.1%} {sub.cfo_name or '-':<10}")
+        src_url = sub.data_source_url or "(未配置)"
+        print(f"{sub.code:<8} {sub.name:<14} {float(sub.ownership_ratio):<8.1%} "
+              f"{sub.cfo_name or '-':<6} {sub.data_source_type or 'csv':<8} {src_url}")
 
 
 def cmd_list_workorders(args):
@@ -276,16 +387,16 @@ def cmd_list_workorders(args):
     if not orders:
         print("暂无工单数据")
         return
-    print(f"{'ID(前8位)':<10} {'责任公司':<10} {'差异金额':>15} {'状态':<12} {'分配给':<10}")
-    print("-" * 60)
+    print(f"{'ID(前8位)':<10} {'差异类型':<20} {'责任公司':<10} {'差异金额':>15} {'状态':<12} {'分配给':<8}")
+    print("-" * 80)
     for wo in orders:
-        print(f"{wo.id[:8]:<10} {wo.responsible_company_code:<10} "
+        print(f"{wo.id[:8]:<10} {wo.discrepancy_type:<20} {wo.responsible_company_code:<10} "
               f"{float(wo.discrepancy_amount or 0):>15,.2f} {wo.status.value:<12} "
-              f"{wo.assigned_to or '-':<10}")
+              f"{wo.assigned_to or '-':<8}")
 
 
 def cmd_demo(args):
-    """生成演示数据用于测试"""
+    """生成演示数据(含差异场景: 金额不一致、商品编码不一致、单边流水)"""
     from models import Subsidiary, InternalTransaction, init_db, SessionLocal
     from notification import setup_logging
     setup_logging()
@@ -293,16 +404,28 @@ def cmd_demo(args):
 
     session = SessionLocal()
 
+    demo_dir = os.path.join(BASE_DIR, "demo_data")
+    os.makedirs(demo_dir, exist_ok=True)
+
     subs = [
         Subsidiary(id="sub01", name="华东子公司", code="SUB01",
                     ownership_ratio=Decimal("0.80"), cfo_name="张三",
-                    finance_staff="李四,王五", is_active=True),
+                    finance_staff="李四,王五",
+                    data_source_type="csv",
+                    data_source_url=os.path.join(demo_dir, "SUB01_{date}.csv"),
+                    is_active=True),
         Subsidiary(id="sub02", name="华南子公司", code="SUB02",
                     ownership_ratio=Decimal("0.65"), cfo_name="赵六",
-                    finance_staff="钱七", is_active=True),
+                    finance_staff="钱七",
+                    data_source_type="csv",
+                    data_source_url=os.path.join(demo_dir, "SUB02_{date}.csv"),
+                    is_active=True),
         Subsidiary(id="sub03", name="华北子公司", code="SUB03",
                     ownership_ratio=Decimal("1.00"), cfo_name="孙八",
-                    finance_staff="周九", is_active=True),
+                    finance_staff="周九",
+                    data_source_type="csv",
+                    data_source_url=os.path.join(demo_dir, "SUB03_{date}.csv"),
+                    is_active=True),
     ]
     for sub in subs:
         existing = session.query(Subsidiary).filter_by(code=sub.code).first()
@@ -310,52 +433,107 @@ def cmd_demo(args):
             session.add(sub)
     session.commit()
 
+    target_date = date.today() - timedelta(days=1)
+    date_str = target_date.isoformat()
+
+    sub01_rows = []
+    sub02_rows = []
+    sub03_rows = []
+
     import uuid
-    base_date = date.today() - timedelta(days=1)
-    transactions = []
-    for i in range(50):
+    for i in range(20):
         buyer_code = subs[i % 3].code
         seller_code = subs[(i + 1) % 3].code
         product_code = f"PROD{i % 10:03d}"
-        amount = Decimal(str((i + 1) * 10000))
+        amount = (i + 1) * 10000
 
-        transactions.append(InternalTransaction(
-            id=str(uuid.uuid4()),
-            company_code=buyer_code,
-            company_name=subs[i % 3].name,
-            counterparty_code=seller_code,
-            counterparty_name=subs[(i + 1) % 3].name,
-            transaction_date=base_date,
-            product_code=product_code,
-            product_name=f"商品{i % 10}",
-            amount=amount,
-            quantity=Decimal(str(i + 1)),
-            direction="buy",
-            source_system="demo",
-        ))
-        transactions.append(InternalTransaction(
-            id=str(uuid.uuid4()),
-            company_code=seller_code,
-            company_name=subs[(i + 1) % 3].name,
-            counterparty_code=buyer_code,
-            counterparty_name=subs[i % 3].name,
-            transaction_date=base_date,
-            product_code=product_code,
-            product_name=f"商品{i % 10}",
-            amount=amount,
-            quantity=Decimal(str(i + 1)),
-            direction="sell",
-            source_system="demo",
-        ))
+        if buyer_code == "SUB01":
+            sub01_rows.append({"transaction_date": date_str, "counterparty_code": seller_code,
+                                "counterparty_name": subs[(i + 1) % 3].name,
+                                "product_code": product_code, "product_name": f"商品{i % 10}",
+                                "amount": amount, "quantity": i + 1, "direction": "buy",
+                                "source_system": "demo"})
+        elif buyer_code == "SUB02":
+            sub02_rows.append({"transaction_date": date_str, "counterparty_code": seller_code,
+                                "counterparty_name": subs[(i + 1) % 3].name,
+                                "product_code": product_code, "product_name": f"商品{i % 10}",
+                                "amount": amount, "quantity": i + 1, "direction": "buy",
+                                "source_system": "demo"})
+        else:
+            sub03_rows.append({"transaction_date": date_str, "counterparty_code": seller_code,
+                                "counterparty_name": subs[(i + 1) % 3].name,
+                                "product_code": product_code, "product_name": f"商品{i % 10}",
+                                "amount": amount, "quantity": i + 1, "direction": "buy",
+                                "source_system": "demo"})
 
-    for tx in transactions:
-        session.add(tx)
-    session.commit()
+        if seller_code == "SUB01":
+            sub01_rows.append({"transaction_date": date_str, "counterparty_code": buyer_code,
+                                "counterparty_name": subs[i % 3].name,
+                                "product_code": product_code, "product_name": f"商品{i % 10}",
+                                "amount": amount, "quantity": i + 1, "direction": "sell",
+                                "source_system": "demo"})
+        elif seller_code == "SUB02":
+            sub02_rows.append({"transaction_date": date_str, "counterparty_code": buyer_code,
+                                "counterparty_name": subs[i % 3].name,
+                                "product_code": product_code, "product_name": f"商品{i % 10}",
+                                "amount": amount, "quantity": i + 1, "direction": "sell",
+                                "source_system": "demo"})
+        else:
+            sub03_rows.append({"transaction_date": date_str, "counterparty_code": buyer_code,
+                                "counterparty_name": subs[i % 3].name,
+                                "product_code": product_code, "product_name": f"商品{i % 10}",
+                                "amount": amount, "quantity": i + 1, "direction": "sell",
+                                "source_system": "demo"})
 
-    print(f"演示数据已生成: {len(subs)} 个子公司, {len(transactions)} 笔交易")
-    print("运行以下命令测试:")
-    print("  python main.py match-concurrent --date " + base_date.isoformat())
-    print("  python main.py list-workorders")
+    sub01_rows.append({"transaction_date": date_str, "counterparty_code": "SUB02",
+                        "counterparty_name": "华南子公司",
+                        "product_code": "PROD999", "product_name": "测试商品-金额差异",
+                        "amount": 500000, "quantity": 10, "direction": "buy",
+                        "source_system": "demo"})
+    sub02_rows.append({"transaction_date": date_str, "counterparty_code": "SUB01",
+                        "counterparty_name": "华东子公司",
+                        "product_code": "PROD999", "product_name": "测试商品-金额差异",
+                        "amount": 450000, "quantity": 9, "direction": "sell",
+                        "source_system": "demo"})
+
+    sub01_rows.append({"transaction_date": date_str, "counterparty_code": "SUB03",
+                        "counterparty_name": "华北子公司",
+                        "product_code": "PROD001", "product_name": "商品A-编码差异买方",
+                        "amount": 200000, "quantity": 20, "direction": "buy",
+                        "source_system": "demo"})
+    sub03_rows.append({"transaction_date": date_str, "counterparty_code": "SUB01",
+                        "counterparty_name": "华东子公司",
+                        "product_code": "PROD002", "product_name": "商品B-编码差异卖方",
+                        "amount": 200000, "quantity": 20, "direction": "sell",
+                        "source_system": "demo"})
+
+    sub02_rows.append({"transaction_date": date_str, "counterparty_code": "SUB03",
+                        "counterparty_name": "华北子公司",
+                        "product_code": "PROD777", "product_name": "单边流水测试",
+                        "amount": 800000, "quantity": 80, "direction": "buy",
+                        "source_system": "demo"})
+
+    csv_headers = ["transaction_date", "counterparty_code", "counterparty_name",
+                    "product_code", "product_name", "amount", "quantity",
+                    "direction", "source_system"]
+
+    for code, rows in [("SUB01", sub01_rows), ("SUB02", sub02_rows), ("SUB03", sub03_rows)]:
+        filename = f"{code}_{date_str}.csv"
+        filepath = os.path.join(demo_dir, filename)
+        with open(filepath, "w", newline="", encoding="utf-8-sig") as f:
+            writer = csv.DictWriter(f, fieldnames=csv_headers)
+            writer.writeheader()
+            writer.writerows(rows)
+
+    print(f"演示数据已生成:")
+    print(f"  3 个子公司 (SUB01/SUB02/SUB03)")
+    print(f"  数据源CSV已写入: {demo_dir}/")
+    print(f"  包含差异场景: 金额不一致(SUB01↔SUB02 PROD999)、商品编码不一致(SUB01↔SUB03)、单边流水(SUB02→SUB03)")
+    print()
+    print("运行以下命令测试闭环:")
+    print(f"  python main.py fetch --date {date_str}")
+    print(f"  python main.py match --date {date_str}")
+    print(f"  python main.py list-workorders")
 
 
 def main():
@@ -367,7 +545,7 @@ def main():
     subparsers.add_parser("init", help="初始化数据库")
     subparsers.add_parser("scheduler", help="启动定时调度器")
 
-    p_fetch = subparsers.add_parser("fetch", help="手动触发交易抓取")
+    p_fetch = subparsers.add_parser("fetch", help="从各子公司数据源抓取交易流水")
     p_fetch.add_argument("--date", help="目标日期 YYYY-MM-DD")
 
     p_match = subparsers.add_parser("match", help="手动触发交易匹配")
@@ -400,7 +578,7 @@ def main():
     p_late.add_argument("--period", required=True, help="期间 YYYY-MM")
     subparsers.add_parser("check-anomalies", help="检查异常")
 
-    p_elim = subparsers.add_parser("add-elimination", help="手工抵消分录")
+    p_elim = subparsers.add_parser("add-elimination", help="手工抵消分录(超500万触发三级审批)")
     p_elim.add_argument("--period", required=True)
     p_elim.add_argument("--amount", type=float, required=True)
     p_elim.add_argument("--debit-company", default="")
@@ -410,19 +588,41 @@ def main():
     p_elim.add_argument("--description", default="")
     p_elim.add_argument("--created-by", default="admin")
 
+    p_lpa = subparsers.add_parser("list-pending-approvals", help="列出待审批的手工抵消分录")
+    p_lpa.add_argument("--period", default=None, help="筛选期间")
+
+    p_ae = subparsers.add_parser("approve-elimination", help="审批通过抵消分录")
+    p_ae.add_argument("--entry-id", required=True, help="分录ID")
+    p_ae.add_argument("--role", required=True, choices=["子公司CFO", "集团财务总监", "CEO"])
+    p_ae.add_argument("--name", required=True, help="审批人姓名")
+    p_ae.add_argument("--comment", default="")
+
+    p_re = subparsers.add_parser("reject-elimination", help="驳回抵消分录")
+    p_re.add_argument("--entry-id", required=True, help="分录ID")
+    p_re.add_argument("--role", required=True, choices=["子公司CFO", "集团财务总监", "CEO"])
+    p_re.add_argument("--name", required=True, help="审批人姓名")
+    p_re.add_argument("--comment", required=True, help="驳回原因")
+
     p_sub = subparsers.add_parser("add-subsidiary", help="添加子公司")
     p_sub.add_argument("--code", required=True)
     p_sub.add_argument("--name", required=True)
     p_sub.add_argument("--ratio", type=float, required=True, help="持股比例 0-1")
     p_sub.add_argument("--cfo", default="")
     p_sub.add_argument("--staff", default="")
+    p_sub.add_argument("--source-type", default="csv", choices=["csv", "http"])
+    p_sub.add_argument("--source-url", default="")
+
+    p_us = subparsers.add_parser("update-subsidiary-source", help="更新子公司数据源配置")
+    p_us.add_argument("--code", required=True, help="子公司编码")
+    p_us.add_argument("--source-type", required=True, choices=["csv", "http"])
+    p_us.add_argument("--source-url", required=True, help="CSV路径或HTTP地址, 可用{date}占位符")
 
     subparsers.add_parser("list-subsidiaries", help="列出子公司")
 
-    p_wo = subparsers.add_parser("list-workorders", help="查询工单")
+    p_wo = subparsers.add_parser("list-workorders", help="查询差异工单")
     p_wo.add_argument("--status", help="open/in_progress/resolved/escalated/closed")
 
-    subparsers.add_parser("demo", help="生成演示数据")
+    subparsers.add_parser("demo", help="生成演示数据(含差异场景和数据源CSV)")
 
     args = parser.parse_args()
 
@@ -441,7 +641,11 @@ def main():
         "check-late": cmd_check_late,
         "check-anomalies": cmd_check_anomalies,
         "add-elimination": cmd_add_elimination,
+        "list-pending-approvals": cmd_list_pending_approvals,
+        "approve-elimination": cmd_approve_elimination,
+        "reject-elimination": cmd_reject_elimination,
         "add-subsidiary": cmd_add_subsidiary,
+        "update-subsidiary-source": cmd_update_subsidiary_source,
         "list-subsidiaries": cmd_list_subsidiaries,
         "list-workorders": cmd_list_workorders,
         "demo": cmd_demo,

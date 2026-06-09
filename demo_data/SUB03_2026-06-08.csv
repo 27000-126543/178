@@ -1,0 +1,15 @@
+﻿transaction_date,counterparty_code,counterparty_name,product_code,product_name,amount,quantity,direction,source_system
+2026-06-08,SUB02,华南子公司,PROD001,商品1,20000,2,sell,demo
+2026-06-08,SUB01,华东子公司,PROD002,商品2,30000,3,buy,demo
+2026-06-08,SUB02,华南子公司,PROD004,商品4,50000,5,sell,demo
+2026-06-08,SUB01,华东子公司,PROD005,商品5,60000,6,buy,demo
+2026-06-08,SUB02,华南子公司,PROD007,商品7,80000,8,sell,demo
+2026-06-08,SUB01,华东子公司,PROD008,商品8,90000,9,buy,demo
+2026-06-08,SUB02,华南子公司,PROD000,商品0,110000,11,sell,demo
+2026-06-08,SUB01,华东子公司,PROD001,商品1,120000,12,buy,demo
+2026-06-08,SUB02,华南子公司,PROD003,商品3,140000,14,sell,demo
+2026-06-08,SUB01,华东子公司,PROD004,商品4,150000,15,buy,demo
+2026-06-08,SUB02,华南子公司,PROD006,商品6,170000,17,sell,demo
+2026-06-08,SUB01,华东子公司,PROD007,商品7,180000,18,buy,demo
+2026-06-08,SUB02,华南子公司,PROD009,商品9,200000,20,sell,demo
+2026-06-08,SUB01,华东子公司,PROD002,商品B-编码差异卖方,200000,20,sell,demo

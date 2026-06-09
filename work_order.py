@@ -2,14 +2,15 @@ import uuid
 import logging
 from datetime import datetime, timedelta
 from decimal import Decimal
-from typing import List, Optional
+from typing import List, Optional, Dict
 
 from sqlalchemy.orm import Session
 from sqlalchemy import and_
 
 from models import (
     SessionLocal, DiscrepancyWorkOrder, WorkOrderStatus,
-    EscalationLevel, ApprovalRecord, ApprovalStatus, OperationLog
+    EscalationLevel, ApprovalRecord, ApprovalStatus, OperationLog,
+    InternalTransaction, MatchStatus
 )
 from config import WORK_ORDER_TIMEOUT_HOURS, MANUAL_ADJUSTMENT_THRESHOLD, APPROVAL_FLOW
 
@@ -39,7 +40,8 @@ class WorkOrderManager:
         return wo
 
     def resolve_work_order(self, work_order_id: str, resolution_note: str,
-                           resolved_by: str = "") -> Optional[DiscrepancyWorkOrder]:
+                           resolved_by: str = "",
+                           category: str = "") -> Optional[DiscrepancyWorkOrder]:
         wo = self.session.query(DiscrepancyWorkOrder).filter_by(id=work_order_id).first()
         if not wo:
             return None
@@ -48,6 +50,10 @@ class WorkOrderManager:
         wo.resolved_at = datetime.utcnow()
         wo.resolution_note = resolution_note
         wo.updated_at = datetime.utcnow()
+        if category:
+            wo.category = category
+
+        self._update_related_transactions(wo)
 
         if wo.discrepancy_amount and wo.discrepancy_amount >= Decimal(str(MANUAL_ADJUSTMENT_THRESHOLD)):
             wo.status = WorkOrderStatus.ESCALATED
@@ -57,6 +63,15 @@ class WorkOrderManager:
         self._log_operation("resolve_work_order", work_order_id,
                             f"解决: {resolution_note[:100]}", resolved_by)
         return wo
+
+    def _update_related_transactions(self, wo: DiscrepancyWorkOrder):
+        for tx_id_attr in ("transaction_id_buy", "transaction_id_sell"):
+            tx_id = getattr(wo, tx_id_attr, None)
+            if not tx_id:
+                continue
+            tx = self.session.query(InternalTransaction).filter_by(id=tx_id).first()
+            if tx and tx.match_status == MatchStatus.PARTIAL:
+                tx.match_status = MatchStatus.EXEMPTED
 
     def _initiate_three_level_approval(self, wo: DiscrepancyWorkOrder, initiator: str = ""):
         """三级审批流程: 子公司CFO → 集团财务总监 → CEO"""
@@ -156,6 +171,84 @@ class WorkOrderManager:
 
     def get_work_order_detail(self, work_order_id: str) -> Optional[DiscrepancyWorkOrder]:
         return self.session.query(DiscrepancyWorkOrder).filter_by(id=work_order_id).first()
+
+    def get_work_order_detail_dict(self, work_order_id: str) -> Optional[Dict]:
+        wo = self.get_work_order_detail(work_order_id)
+        if not wo:
+            return None
+        result = {
+            "id": wo.id,
+            "discrepancy_type": wo.discrepancy_type,
+            "discrepancy_amount": float(wo.discrepancy_amount or 0),
+            "discrepancy_description": wo.discrepancy_description or "",
+            "responsible_company_code": wo.responsible_company_code,
+            "assigned_to": wo.assigned_to or "",
+            "status": wo.status.value,
+            "category": wo.category or "",
+            "resolution_note": wo.resolution_note or "",
+            "processing_notes": wo.processing_notes or "",
+            "escalation_level": wo.escalation_level.value if wo.escalation_level else "",
+            "escalated_at": wo.escalated_at.isoformat() if wo.escalated_at else "",
+            "resolved_at": wo.resolved_at.isoformat() if wo.resolved_at else "",
+            "created_at": wo.created_at.isoformat() if wo.created_at else "",
+            "updated_at": wo.updated_at.isoformat() if wo.updated_at else "",
+            "related_transactions": [],
+        }
+        for tx_id_attr in ("transaction_id_buy", "transaction_id_sell"):
+            tx_id = getattr(wo, tx_id_attr, None)
+            if not tx_id:
+                continue
+            tx = self.session.query(InternalTransaction).filter_by(id=tx_id).first()
+            if tx:
+                result["related_transactions"].append({
+                    "id": tx.id,
+                    "company_code": tx.company_code,
+                    "counterparty_code": tx.counterparty_code,
+                    "product_code": tx.product_code,
+                    "amount": float(tx.amount),
+                    "direction": tx.direction,
+                    "match_status": tx.match_status.value,
+                })
+        return result
+
+    def update_work_order(self, work_order_id: str, status: str = None,
+                          note: str = None, category: str = None,
+                          assigned_to: str = None) -> Optional[DiscrepancyWorkOrder]:
+        wo = self.session.query(DiscrepancyWorkOrder).filter_by(id=work_order_id).first()
+        if not wo:
+            return None
+
+        if status:
+            try:
+                new_status = WorkOrderStatus(status)
+                wo.status = new_status
+                if new_status == WorkOrderStatus.IN_PROGRESS and not wo.assigned_to and assigned_to:
+                    wo.assigned_to = assigned_to
+            except ValueError:
+                logger.error(f"无效工单状态: {status}")
+                return None
+
+        if category:
+            wo.category = category
+
+        if note:
+            existing_notes = wo.processing_notes or ""
+            timestamp = datetime.utcnow().strftime("%Y-%m-%d %H:%M")
+            wo.processing_notes = f"{existing_notes}\n[{timestamp}] {note}" if existing_notes else f"[{timestamp}] {note}"
+
+        if assigned_to:
+            wo.assigned_to = assigned_to
+
+        wo.updated_at = datetime.utcnow()
+        self.session.commit()
+
+        if status == WorkOrderStatus.RESOLVED.value:
+            self._update_related_transactions(wo)
+            self.session.commit()
+
+        self._log_operation("update_work_order", work_order_id,
+                            f"状态={status or '不变'}, 分类={category or '不变'}")
+        return wo
 
     def close_work_order(self, work_order_id: str, closed_by: str = "") -> bool:
         wo = self.session.query(DiscrepancyWorkOrder).filter_by(id=work_order_id).first()

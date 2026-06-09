@@ -2,7 +2,7 @@ import uuid
 import logging
 from datetime import datetime
 from decimal import Decimal
-from typing import List, Dict, Optional
+from typing import List, Dict, Optional, Tuple
 
 from sqlalchemy.orm import Session
 from sqlalchemy import func
@@ -329,42 +329,115 @@ class ConsolidationEngine:
 
     def approve_elimination_entry(self, entry_id: str, approver_role: str,
                                   approver_name: str, approved: bool,
-                                  comment: str = "") -> bool:
+                                  comment: str = "") -> Tuple[bool, str]:
         entry = self.session.query(EliminationEntry).filter_by(id=entry_id).first()
         if not entry:
-            return False
+            return False, "抵消分录不存在"
 
-        pending = self.session.query(EliminationApproval).filter(
+        if not entry.requires_approval:
+            return False, "该分录无需审批"
+
+        if entry.approval_status == ApprovalStatus.APPROVED:
+            return False, "该分录已审批通过"
+        if entry.approval_status == ApprovalStatus.REJECTED:
+            return False, "该分录已被驳回"
+
+        role_idx = APPROVAL_FLOW.index(approver_role) if approver_role in APPROVAL_FLOW else -1
+        if role_idx < 0:
+            return False, f"无效审批角色: {approver_role}"
+
+        for prev_idx in range(role_idx):
+            prev_role = APPROVAL_FLOW[prev_idx]
+            prev_approval = self.session.query(EliminationApproval).filter(
+                EliminationApproval.entry_id == entry_id,
+                EliminationApproval.approver_role == prev_role,
+            ).first()
+            if not prev_approval or prev_approval.status != ApprovalStatus.APPROVED:
+                return False, f"前置审批未通过: {prev_role}，请先完成该角色审批"
+
+        current_approval = self.session.query(EliminationApproval).filter(
             EliminationApproval.entry_id == entry_id,
             EliminationApproval.approver_role == approver_role,
-            EliminationApproval.status == ApprovalStatus.PENDING,
         ).first()
 
-        if not pending:
-            return False
+        if not current_approval:
+            return False, f"未找到 {approver_role} 的审批记录"
+
+        if current_approval.status != ApprovalStatus.PENDING:
+            return False, f"{approver_role} 已审批(状态: {current_approval.status.value})"
 
         if approved:
-            pending.status = ApprovalStatus.APPROVED
-            pending.approver_name = approver_name
-            pending.approved_at = datetime.utcnow()
-            pending.comment = comment
+            current_approval.status = ApprovalStatus.APPROVED
+            current_approval.approver_name = approver_name
+            current_approval.approved_at = datetime.utcnow()
+            current_approval.comment = comment
 
-            next_idx = APPROVAL_FLOW.index(approver_role) + 1
+            next_idx = role_idx + 1
             if next_idx >= len(APPROVAL_FLOW):
                 entry.approval_status = ApprovalStatus.APPROVED
                 logger.info(f"抵消分录 {entry_id} 三级审批全部通过")
             else:
                 logger.info(f"抵消分录 {entry_id} {approver_role} 通过, 等待 {APPROVAL_FLOW[next_idx]}")
         else:
-            pending.status = ApprovalStatus.REJECTED
-            pending.approver_name = approver_name
-            pending.approved_at = datetime.utcnow()
-            pending.comment = comment
+            current_approval.status = ApprovalStatus.REJECTED
+            current_approval.approver_name = approver_name
+            current_approval.approved_at = datetime.utcnow()
+            current_approval.comment = comment
             entry.approval_status = ApprovalStatus.REJECTED
+            for later_idx in range(role_idx + 1, len(APPROVAL_FLOW)):
+                later_approval = self.session.query(EliminationApproval).filter(
+                    EliminationApproval.entry_id == entry_id,
+                    EliminationApproval.approver_role == APPROVAL_FLOW[later_idx],
+                ).first()
+                if later_approval and later_approval.status == ApprovalStatus.PENDING:
+                    later_approval.status = ApprovalStatus.CANCELLED
             logger.info(f"抵消分录 {entry_id} {approver_role} 驳回")
 
         self.session.commit()
-        return True
+        return True, "审批成功" if approved else "已驳回"
+
+    def list_pending_approvals(self, period: str = None) -> List[Dict]:
+        query = self.session.query(EliminationEntry).filter(
+            EliminationEntry.is_manual == True,
+            EliminationEntry.requires_approval == True,
+            EliminationEntry.approval_status == ApprovalStatus.PENDING,
+        )
+        if period:
+            query = query.filter_by(period=period)
+
+        entries = query.all()
+        results = []
+        for entry in entries:
+            approvals = self.session.query(EliminationApproval).filter(
+                EliminationApproval.entry_id == entry.id
+            ).order_by(EliminationApproval.created_at).all()
+
+            current_step = None
+            approval_detail = []
+            for a in approvals:
+                approval_detail.append({
+                    "role": a.approver_role,
+                    "status": a.status.value,
+                    "approver": a.approver_name or "",
+                    "comment": a.comment or "",
+                    "approved_at": a.approved_at.isoformat() if a.approved_at else "",
+                })
+                if a.status == ApprovalStatus.PENDING and current_step is None:
+                    current_step = a.approver_role
+
+            results.append({
+                "entry_id": entry.id,
+                "period": entry.period,
+                "entry_type": entry.entry_type,
+                "amount": float(entry.amount),
+                "description": entry.description,
+                "created_by": entry.created_by,
+                "current_step": current_step or "已完成",
+                "approval_detail": approval_detail,
+                "debit_company": entry.debit_company,
+                "credit_company": entry.credit_company,
+            })
+        return results
 
     def get_elimination_entries(self, period: str, is_manual: bool = None) -> List[EliminationEntry]:
         query = self.session.query(EliminationEntry).filter_by(period=period)

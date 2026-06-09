@@ -10,7 +10,8 @@ from sqlalchemy import func
 
 from models import (
     SessionLocal, ConsolidationWorksheet, EliminationEntry,
-    ConsolidatedReport, TrialBalance, Subsidiary, ApprovalStatus, OperationLog
+    ConsolidatedReport, TrialBalance, Subsidiary, ApprovalStatus, OperationLog,
+    DiscrepancyWorkOrder, WorkOrderStatus, EliminationApproval, ReportSubmission
 )
 from config import APPROVAL_FLOW
 
@@ -278,7 +279,55 @@ class ReportGenerator:
 
         return notes
 
-    def export_to_excel(self, period: str, report_type: str = "all") -> str:
+    def check_report_risks(self, period: str) -> List[Dict]:
+        risks = []
+
+        pending_entries = self.session.query(EliminationEntry).filter(
+            EliminationEntry.period == period,
+            EliminationEntry.requires_approval == True,
+            EliminationEntry.approval_status == ApprovalStatus.PENDING,
+        ).all()
+        for entry in pending_entries:
+            risks.append({
+                "level": "high",
+                "type": "pending_approval",
+                "description": f"手工抵消分录(ID={entry.id[:8]})金额{float(entry.amount):,.2f}元待审批, 未审批不计入报表",
+                "amount": float(entry.amount),
+                "id": entry.id,
+            })
+
+        major_open_orders = self.session.query(DiscrepancyWorkOrder).filter(
+            DiscrepancyWorkOrder.status.in_([WorkOrderStatus.OPEN, WorkOrderStatus.IN_PROGRESS]),
+            DiscrepancyWorkOrder.discrepancy_amount >= 100000,
+        ).all()
+        for wo in major_open_orders:
+            risks.append({
+                "level": "high",
+                "type": "unresolved_discrepancy",
+                "description": f"未解决差异工单(ID={wo.id[:8]})差异金额{float(wo.discrepancy_amount or 0):,.2f}元, 类型={wo.discrepancy_type}",
+                "amount": float(wo.discrepancy_amount or 0),
+                "id": wo.id,
+            })
+
+        subsidiaries = self.session.query(Subsidiary).filter_by(is_active=True).all()
+        for sub in subsidiaries:
+            tb_count = self.session.query(TrialBalance).filter(
+                TrialBalance.company_code == sub.code,
+                TrialBalance.period == period,
+            ).count()
+            if tb_count == 0:
+                risks.append({
+                    "level": "medium",
+                    "type": "missing_trial_balance",
+                    "description": f"子公司{sub.name}({sub.code})未提交{period}期间试算平衡表",
+                    "amount": 0,
+                    "id": sub.code,
+                })
+
+        return risks
+
+    def export_to_excel(self, period: str, report_type: str = "all",
+                        is_draft: bool = False) -> str:
         """导出合并报表为Excel"""
         try:
             import openpyxl
@@ -332,14 +381,19 @@ class ReportGenerator:
                                         border, num_format)
 
         filename = f"合并报表_{period}_{datetime.now().strftime('%Y%m%d%H%M%S')}.xlsx"
+        if is_draft:
+            filename = f"合并报表_{period}_草稿_{datetime.now().strftime('%Y%m%d%H%M%S')}.xlsx"
         filepath = os.path.join(OUTPUT_DIR, filename)
         wb.save(filepath)
         logger.info(f"Excel导出: {filepath}")
 
-        self._save_report_record(period, report_type, excel_path=filepath)
+        risks = self.check_report_risks(period)
+        self._save_report_record(period, report_type, excel_path=filepath,
+                                  is_draft=is_draft, risk_items=risks)
         return filepath
 
-    def export_to_pdf(self, period: str, report_type: str = "all") -> str:
+    def export_to_pdf(self, period: str, report_type: str = "all",
+                      is_draft: bool = False) -> str:
         """导出合并报表为PDF (带图表)"""
         try:
             from reportlab.lib.pagesizes import A4
@@ -355,6 +409,8 @@ class ReportGenerator:
             return ""
 
         filename = f"合并报表_{period}_{datetime.now().strftime('%Y%m%d%H%M%S')}.pdf"
+        if is_draft:
+            filename = f"合并报表_{period}_草稿_{datetime.now().strftime('%Y%m%d%H%M%S')}.pdf"
         filepath = os.path.join(OUTPUT_DIR, filename)
 
         doc = SimpleDocTemplate(filepath, pagesize=A4)
@@ -420,6 +476,99 @@ class ReportGenerator:
             elements.append(t)
             elements.append(Spacer(1, 20))
 
+        if report_type in ("all", "cash_flow"):
+            cf = self.generate_consolidated_cash_flow(period)
+            elements.append(Paragraph("合并现金流量表", styles["Title"]))
+            elements.append(Spacer(1, 10))
+            table_data = [["项目", "金额(元)"]]
+            table_data.append(["一、经营活动现金流量净额",
+                                f"{cf['operating_activities']['net_cash_operating']:,.2f}"])
+            table_data.append(["二、投资活动现金流量净额",
+                                f"{cf['investing_activities']['net_cash_from_investing']:,.2f}"])
+            table_data.append(["三、筹资活动现金流量净额",
+                                f"{cf['financing_activities']['net_cash_from_financing']:,.2f}"])
+            table_data.append(["现金净增加额", f"{cf['net_increase_cash']:,.2f}"])
+            table_data.append(["期末现金余额", f"{cf['cash_ending']:,.2f}"])
+
+            t = Table(table_data, colWidths=[300, 200])
+            t.setStyle(TableStyle([
+                ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#4472C4")),
+                ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
+                ("GRID", (0, 0), (-1, -1), 0.5, colors.grey),
+                ("FONTSIZE", (0, 0), (-1, -1), 9),
+                ("ALIGN", (1, 0), (1, -1), "RIGHT"),
+            ]))
+            elements.append(t)
+            elements.append(Spacer(1, 20))
+
+        if report_type == "all":
+            notes = self.generate_notes(period)
+            elements.append(Paragraph("附注", styles["Title"]))
+            elements.append(Spacer(1, 10))
+
+            elements.append(Paragraph("一、合并范围", styles["Heading2"]))
+            elements.append(Spacer(1, 5))
+            comp_data = [["编码", "名称", "持股比例"]]
+            for comp in notes.get("company_listing", []):
+                comp_data.append([comp["code"], comp["name"], f"{comp['ownership_ratio']:.1%}"])
+            t = Table(comp_data, colWidths=[100, 200, 100])
+            t.setStyle(TableStyle([
+                ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#4472C4")),
+                ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
+                ("GRID", (0, 0), (-1, -1), 0.5, colors.grey),
+                ("FONTSIZE", (0, 0), (-1, -1), 8),
+            ]))
+            elements.append(t)
+            elements.append(Spacer(1, 15))
+
+            elements.append(Paragraph("二、抵消分录汇总", styles["Heading2"]))
+            elements.append(Spacer(1, 5))
+            elim_data = [["类型", "借方公司", "贷方公司", "金额(元)", "说明"]]
+            for elim in notes.get("elimination_summary", []):
+                elim_data.append([
+                    elim["type"],
+                    elim["debit_company"],
+                    elim["credit_company"],
+                    f"{elim['amount']:,.2f}",
+                    (elim.get("description") or "")[:30],
+                ])
+            if len(elim_data) > 1:
+                t = Table(elim_data, colWidths=[80, 70, 70, 80, 150])
+                t.setStyle(TableStyle([
+                    ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#4472C4")),
+                    ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
+                    ("GRID", (0, 0), (-1, -1), 0.5, colors.grey),
+                    ("FONTSIZE", (0, 0), (-1, -1), 7),
+                    ("ALIGN", (3, 0), (3, -1), "RIGHT"),
+                ]))
+                elements.append(t)
+            else:
+                elements.append(Paragraph("无抵消分录", styles["Normal"]))
+            elements.append(Spacer(1, 15))
+
+            elements.append(Paragraph("三、少数股东权益明细", styles["Heading2"]))
+            elements.append(Spacer(1, 5))
+            mi_data = [["子公司", "金额(元)"]]
+            for mi in notes.get("minority_interest_detail", []):
+                mi_data.append([mi["company_name"], f"{mi['amount']:,.2f}"])
+            if len(mi_data) > 1:
+                t = Table(mi_data, colWidths=[200, 200])
+                t.setStyle(TableStyle([
+                    ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#4472C4")),
+                    ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
+                    ("GRID", (0, 0), (-1, -1), 0.5, colors.grey),
+                    ("FONTSIZE", (0, 0), (-1, -1), 8),
+                    ("ALIGN", (1, 0), (1, -1), "RIGHT"),
+                ]))
+                elements.append(t)
+            else:
+                elements.append(Paragraph("无少数股东权益", styles["Normal"]))
+            elements.append(Spacer(1, 15))
+
+            elements.append(Paragraph("四、会计政策", styles["Heading2"]))
+            elements.append(Spacer(1, 5))
+            elements.append(Paragraph(notes.get("accounting_policies", ""), styles["Normal"]))
+
         chart_path = self._generate_chart(period)
         if chart_path and os.path.exists(chart_path):
             try:
@@ -432,7 +581,9 @@ class ReportGenerator:
         doc.build(elements)
         logger.info(f"PDF导出: {filepath}")
 
-        self._save_report_record(period, report_type, pdf_path=filepath)
+        risks = self.check_report_risks(period)
+        self._save_report_record(period, report_type, pdf_path=filepath,
+                                  is_draft=is_draft, risk_items=risks)
         return filepath
 
     def _generate_chart(self, period: str) -> str:
