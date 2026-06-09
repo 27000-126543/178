@@ -516,21 +516,159 @@ def cmd_list_reports(args):
     if not reports:
         print("暂无报表记录")
         return
-    print(f"{'ID(前8位)':<10} {'期间':<10} {'类型':<8} {'草稿':<4} {'PDF':<6} {'Excel':<6} {'风险项':>6} {'生成时间'}")
-    print("-" * 80)
+    print(f"{'ID(前8位)':<10} {'期间':<10} {'类型':<6} {'状态':<8} {'PDF':<4} {'Excel':<4} {'风险':>4} {'来源草稿':<10} {'发布人':<8} {'生成时间'}")
+    print("-" * 105)
     for r in reports:
         has_pdf = "✓" if r.file_path_pdf else "✗"
         has_excel = "✓" if r.file_path_excel else "✗"
-        is_draft = "是" if r.is_draft else "否"
         risk_count = 0
         if r.risk_items:
             try:
                 risk_count = len(json.loads(r.risk_items))
             except Exception:
                 pass
-        gen_time = r.generated_at.strftime("%Y-%m-%d %H:%M") if r.generated_at else "-"
-        print(f"{r.id[:8]:<10} {r.period:<10} {r.report_type:<8} {is_draft:<4} "
-              f"{has_pdf:<6} {has_excel:<6} {risk_count:>6} {gen_time}")
+        gen_time = r.generated_at.strftime("%m-%d %H:%M") if r.generated_at else "-"
+        status = r.report_status or ("draft" if r.is_draft else "published")
+        status_map = {"draft": "草稿", "published": "已发布", "revoked": "已撤回"}
+        status_str = status_map.get(status, status)
+        source = r.draft_source_id[:8] if r.draft_source_id else "-"
+        publisher = r.published_by or "-"
+        print(f"{r.id[:8]:<10} {r.period:<10} {r.report_type:<6} {status_str:<8} "
+              f"{has_pdf:<4} {has_excel:<4} {risk_count:>4} {source:<10} {publisher:<8} {gen_time}")
+
+
+def cmd_publish_report(args):
+    from report_generator import ReportGenerator
+    from notification import setup_logging
+    setup_logging()
+    gen = ReportGenerator()
+    result = gen.publish_report(args.id, args.published_by)
+    if not result:
+        print(f"发布失败: 报表 {args.id} 不存在、非草稿状态或仍存在风险项")
+        return
+    print(f"✓ 正式版已发布")
+    print(f"  报表ID: {result.id[:8]}")
+    print(f"  期间: {result.period}")
+    print(f"  来源草稿: {result.draft_source_id[:8]}")
+    print(f"  发布人: {result.published_by}")
+    print(f"  发布时间: {result.published_at.strftime('%Y-%m-%d %H:%M')}")
+    if result.file_path_excel:
+        print(f"  Excel: {result.file_path_excel}")
+    if result.file_path_pdf:
+        print(f"  PDF: {result.file_path_pdf}")
+
+
+def cmd_revoke_report(args):
+    from report_generator import ReportGenerator
+    from notification import setup_logging
+    setup_logging()
+    gen = ReportGenerator()
+    result = gen.revoke_report(args.id, args.revoked_by, args.reason)
+    if not result:
+        print(f"撤回失败: 报表 {args.id} 不存在或非已发布状态")
+        return
+    print(f"✓ 正式版已撤回")
+    print(f"  报表ID: {result.id[:8]}")
+    print(f"  期间: {result.period}")
+    print(f"  撤回人: {result.revoked_by}")
+    print(f"  撤回时间: {result.revoked_at.strftime('%Y-%m-%d %H:%M')}")
+    print(f"  撤回原因: {result.revoke_reason}")
+
+
+def cmd_audit_report(args):
+    from models import (SessionLocal, ConsolidatedReport, FetchBatch,
+                         DiscrepancyWorkOrder, WorkOrderStatus, TrialBalance,
+                         EliminationEntry, ApprovalStatus, EliminationApproval,
+                         OperationLog)
+    from notification import setup_logging
+    setup_logging()
+    session = SessionLocal()
+    period = args.period
+
+    print(f"=== {period} 期间报表审计时间线 ===\n")
+
+    print(f"── 1. 数据抓取批次 ──")
+    batches = session.query(FetchBatch).filter(
+        FetchBatch.fetch_date >= period + "-01",
+        FetchBatch.fetch_date <= period + "-31",
+    ).order_by(FetchBatch.created_at).all()
+    if batches:
+        for b in batches:
+            print(f"  {b.created_at.strftime('%Y-%m-%d %H:%M') if b.created_at else '-'}  "
+                  f"{b.company_code}  {b.status}  {b.record_count}条  "
+                  f"{f'错误: {b.error_message[:30]}' if b.error_message else ''}")
+    else:
+        print("  (无记录)")
+
+    print(f"\n── 2. 差异工单处理 ──")
+    work_orders = session.query(DiscrepancyWorkOrder).filter(
+        DiscrepancyWorkOrder.discrepancy_description.like(f"%{period}%"),
+    ).order_by(DiscrepancyWorkOrder.created_at).all()
+    if not work_orders:
+        work_orders = session.query(DiscrepancyWorkOrder).filter(
+            DiscrepancyWorkOrder.created_at >= period + "-01",
+            DiscrepancyWorkOrder.created_at <= period + "-31",
+        ).order_by(DiscrepancyWorkOrder.created_at).all()
+    if work_orders:
+        for wo in work_orders:
+            resolved = wo.resolved_at.strftime('%Y-%m-%d %H:%M') if wo.resolved_at else "-"
+            print(f"  创建: {wo.created_at.strftime('%Y-%m-%d %H:%M') if wo.created_at else '-'}  "
+                  f"类型={wo.discrepancy_type}  金额={float(wo.discrepancy_amount or 0):,.0f}  "
+                  f"状态={wo.status.value}  分类={wo.category or '-'}  "
+                  f"解决={resolved}")
+    else:
+        print("  (无记录)")
+
+    print(f"\n── 3. 试算平衡表提交 ──")
+    tbs = session.query(TrialBalance).filter_by(period=period).all()
+    if tbs:
+        seen = set()
+        for tb in tbs:
+            if tb.company_code not in seen:
+                seen.add(tb.company_code)
+                print(f"  {tb.company_code}  {tb.account_name}  "
+                      f"提交时间={tb.created_at.strftime('%Y-%m-%d %H:%M') if tb.created_at else '-'}")
+    else:
+        print("  (未提交)")
+
+    print(f"\n── 4. 抵消分录审批 ──")
+    elim_entries = session.query(EliminationEntry).filter_by(period=period).all()
+    if elim_entries:
+        for entry in elim_entries:
+            approval_str = entry.approval_status.value if entry.approval_status else "-"
+            manual = "(手工)" if entry.is_manual else ""
+            print(f"  {entry.created_at.strftime('%Y-%m-%d %H:%M') if entry.created_at else '-'}  "
+                  f"金额={float(entry.amount):,.0f}{manual}  审批={approval_str}  "
+                  f"描述={entry.description or '-'}")
+            for ap in entry.approval_records:
+                ap_time = ap.approved_at.strftime('%Y-%m-%d %H:%M') if ap.approved_at else "-"
+                print(f"    {ap.approver_role}  {ap.status.value}  {ap.approver_name or '-'}  {ap_time}")
+    else:
+        print("  (无记录)")
+
+    print(f"\n── 5. 报表发布记录 ──")
+    reports = session.query(ConsolidatedReport).filter_by(period=period).order_by(
+        ConsolidatedReport.generated_at
+    ).all()
+    if reports:
+        for r in reports:
+            status_map = {"draft": "草稿", "published": "已发布", "revoked": "已撤回"}
+            status_str = status_map.get(r.report_status or "", r.report_status or "?")
+            line = (f"  {r.generated_at.strftime('%Y-%m-%d %H:%M') if r.generated_at else '-'}  "
+                    f"ID={r.id[:8]}  {status_str}")
+            if r.published_by:
+                line += f"  发布人={r.published_by}"
+            if r.published_at:
+                line += f"  发布时间={r.published_at.strftime('%Y-%m-%d %H:%M')}"
+            if r.revoked_by:
+                line += f"  撤回人={r.revoked_by}"
+            if r.revoke_reason:
+                line += f"  原因={r.revoke_reason[:30]}"
+            if r.draft_source_id:
+                line += f"  来源草稿={r.draft_source_id[:8]}"
+            print(line)
+    else:
+        print("  (无记录)")
 
 
 def cmd_demo(args):
@@ -783,6 +921,18 @@ def main():
     p_lr = subparsers.add_parser("list-reports", help="查询历史报表")
     p_lr.add_argument("--period", help="按期间筛选 YYYY-MM")
 
+    p_pub = subparsers.add_parser("publish-report", help="将草稿发布为正式版")
+    p_pub.add_argument("--id", required=True, help="草稿报表ID")
+    p_pub.add_argument("--published-by", required=True, help="发布人姓名")
+
+    p_revoke = subparsers.add_parser("revoke-report", help="撤回已发布的正式版报表")
+    p_revoke.add_argument("--id", required=True, help="报表ID")
+    p_revoke.add_argument("--revoked-by", required=True, help="撤回人姓名")
+    p_revoke.add_argument("--reason", required=True, help="撤回原因")
+
+    p_audit = subparsers.add_parser("audit-report", help="查看期间报表审计时间线")
+    p_audit.add_argument("--period", required=True, help="期间 YYYY-MM")
+
     args = parser.parse_args()
 
     commands = {
@@ -811,6 +961,9 @@ def main():
         "update-workorder": cmd_update_workorder,
         "list-fetch-batches": cmd_list_fetch_batches,
         "list-reports": cmd_list_reports,
+        "publish-report": cmd_publish_report,
+        "revoke-report": cmd_revoke_report,
+        "audit-report": cmd_audit_report,
         "demo": cmd_demo,
     }
 
